@@ -1,26 +1,11 @@
-
-# Coffee Roast Classifier API
-# ===========================
-
-
-# API desarrollada con FastAPI para la clasificación del grado de tostado del café a partir de imágenes.
-# El sistema integra:
-# - Un modelo UNet para segmentación de granos de café.
-# - Un modelo CNN para clasificación del tostado.
-# - Validaciones geométricas y métricas de incertidumbre para filtrar entradas inválidas.
-
-
-# La API recibe una imagen, segmenta los granos, valida el contenido, clasifica el tostado y devuelve
-# la predicción junto con métricas y una visualización de la segmentación en formato Base64.
-
-
 import io
 import cv2
 import base64
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.transforms.functional as F
+import torchvision
+from torchvision.models import convnext_tiny # Importación necesaria
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -32,11 +17,6 @@ import logging
 # ==========================================
 # CONFIGURACIÓN DE LOGGING
 # ==========================================
-"""
-Configura el sistema de logging para registrar eventos informativos y errores
-relacionados con el ciclo de vida de la API y el procesamiento de inferencias.
-"""
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -46,59 +26,25 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # CONFIGURACIÓN GLOBAL
 # ==========================================
-"""
-Define parámetros globales del sistema:
-- Dimensiones de entrada de imagen
-- Parámetros de validación geométrica
-- Umbrales de confianza e incertidumbre
-- Configuración de clases
-"""
-
+IMG_SIZE_BINARY = (224, 224) 
 IMG_SIZE = (128, 128)
 CHANNELS = 3
-NUM_CLASSES = 5
+NUM_CLASSES_ROAST = 5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-MIN_OBJECTS_FOR_LOOSE_CHECK = 3
-
-
-SINGLE_OBJ_MAX_AREA_RATIO = 0.95
-SINGLE_OBJ_MIN_SOLIDITY = 0.88
-SINGLE_OBJ_MIN_AR = 0.5
-SINGLE_OBJ_MAX_AR = 2.0
-
-
-MULTI_OBJ_MIN_SOLIDITY = 0.60
-MULTI_OBJ_MIN_AREA_RATIO = 0.05
-
-
-MC_DROPOUT_ITERATIONS = 15
-MAX_STD_DEV = 0.20
-CONF_THRESHOLD = 0.60
-
-
-CLASS_NAMES = {
-0: 'Dark',
-1: 'Green',
-2: 'Light',
-3: 'Medium',
-4: 'Overbaking'
-}
-
-
+# --- Rutas de Pesos ---
 BASE_DIR = Path(__file__).resolve().parent
-
 UNET_WEIGHTS = f"{BASE_DIR}/unet_segmentation_model_best.pth"
-CNN_WEIGHTS = f"{BASE_DIR}/cnn_segmented_cnn_(optimizado)_best.pth"
+CNN_ROAST_WEIGHTS = f"{BASE_DIR}/cnn_segmented_cnn_(optimizado)_best.pth"
+BINARY_WEIGHTS = f"{BASE_DIR}/modelo_cafe_pytorch_final.pth" 
+
+CLASS_NAMES = {0: 'Dark', 1: 'Green', 2: 'Light', 3: 'Medium', 4: 'Overbaking'}
 
 # ==========================================
 # DEFINICIÓN DE ARQUITECTURAS
 # ==========================================
-"""
-Bloque convolucional básico utilizado en la arquitectura UNet.
-Combina convoluciones 2D y funciones de activación ReLU.
-"""
+
+# --- 1. UNet (Segmentación) ---
 def conv_block(in_c, out_c):
     return nn.Sequential(
         nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
@@ -107,10 +53,6 @@ def conv_block(in_c, out_c):
         nn.ReLU(inplace=True)
     )
     
-"""
-Arquitectura UNet simplificada para segmentación binaria de granos de café.
-Produce una máscara que identifica las regiones relevantes de la imagen.
-"""
 class UNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=1):
         super(UNet, self).__init__()
@@ -131,11 +73,7 @@ class UNet(nn.Module):
         u5 = self.up_conv2(c4); u5 = torch.cat([u5, c1], dim=1); c5 = self.d2(u5)
         return self.out(c5)
 
-"""
-Arquitectura CNN para clasificación del grado de tostado del café.
-Incluye Dropout para permitir estimación de incertidumbre mediante MC Dropout.
-"""
-
+# --- 2. Roast Classifier (CNN Original) ---
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes, dropout_rate=0.5):
         super(SimpleCNN, self).__init__()
@@ -160,21 +98,26 @@ class SimpleCNN(nn.Module):
         x = self.classifier(x)
         return x
 
+# --- 3. Binary Classifier (ConvNeXt Tiny) ---
+def build_binary_model():
+
+    model = convnext_tiny(weights=None)
+
+    model.classifier[2] = nn.Linear(
+        model.classifier[2].in_features,
+        1
+    )
+    return model
+
 # ==========================================
 # CONFIGURACIÓN DE LA APLICACIÓN
 # ==========================================
-"""
-Inicializa la aplicación FastAPI, configura CORS y define el esquema
-estándar de respuesta para el endpoint de predicción.
-"""
 
 app = FastAPI(title="Coffee Roast Classifier API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -187,46 +130,46 @@ class PredictionResponse(BaseModel):
     mensaje_error: str = ""
     metricas_validacion: dict = {}
 
-"""
-Evento de arranque de la aplicación.
-Carga los modelos de segmentación y clasificación en memoria
-para evitar recargas en cada solicitud.
-"""
 @app.on_event("startup")
 def load_models():
     logger.info(f"Iniciando API en dispositivo: {DEVICE}")
+    
+    # 1. Instanciar Modelos
     app.state.unet = UNet(in_channels=CHANNELS, out_channels=1).to(DEVICE)
-    app.state.cnn = SimpleCNN(num_classes=NUM_CLASSES).to(DEVICE)
+    app.state.roast_cnn = SimpleCNN(num_classes=NUM_CLASSES_ROAST).to(DEVICE)
+    app.state.binary_cnn = build_binary_model().to(DEVICE) 
     
     try:
+        # 2. Cargar Pesos
+        # UNet
         u_ckpt = torch.load(UNET_WEIGHTS, map_location=DEVICE)
         app.state.unet.load_state_dict(u_ckpt.get('model_state_dict', u_ckpt))
         app.state.unet.eval()
         
-        c_ckpt = torch.load(CNN_WEIGHTS, map_location=DEVICE)
-        app.state.cnn.load_state_dict(c_ckpt.get('model_state_dict', c_ckpt))
-        app.state.cnn.eval()
-        logger.info("Modelos cargados correctamente.")
+        # Roast CNN
+        c_ckpt = torch.load(CNN_ROAST_WEIGHTS, map_location=DEVICE)
+        app.state.roast_cnn.load_state_dict(c_ckpt.get('model_state_dict', c_ckpt))
+        app.state.roast_cnn.eval()
+
+        # Binary ConvNeXt
+        if Path(BINARY_WEIGHTS).exists():
+            b_ckpt = torch.load(BINARY_WEIGHTS, map_location=DEVICE)
+            if isinstance(b_ckpt, dict) and 'model_state_dict' in b_ckpt:
+                b_ckpt = b_ckpt['model_state_dict']
+            app.state.binary_cnn.load_state_dict(b_ckpt)
+            app.state.binary_cnn.eval()
+            logger.info("Todos los modelos (UNet, RoastCNN, ConvNeXt) cargados correctamente.")
+        else:
+            logger.warning(f"ADVERTENCIA: No se encontró {BINARY_WEIGHTS}")
+
     except Exception as e:
         logger.error(f"Error cargando modelos: {e}")
 
 # ==========================================
-# FUNCIONES UTILITARIAS DE PREPROCESAMIENTO
+# UTILIDADES
 # ==========================================
-"""
-Normaliza un tensor de imagen utilizando una transformación lineal
-centrada en cero, adecuada para la inferencia de los modelos entrenados.
-"""
-
 def normalize(tensor):
     return (tensor - 0.5) / 0.5
-
-"""
-Convierte una imagen PIL a un tensor de PyTorch, realizando:
-- Conversión de espacio de color RGB a Lab
-- Normalización de valores
-- Reordenamiento de dimensiones
-"""
 
 def process_pil_to_tensor(image_pil: Image.Image) -> torch.Tensor:
     img_np = np.array(image_pil)
@@ -235,14 +178,9 @@ def process_pil_to_tensor(image_pil: Image.Image) -> torch.Tensor:
     tensor = torch.from_numpy(np.transpose(img_float, (2, 0, 1))).float()
     return tensor.unsqueeze(0).to(DEVICE)
     
-"""
-Genera una visualización superpuesta entre la imagen original y la máscara
-segmentada, codificada en Base64 para su envío al frontend.
-"""
 def create_overlay_image(original_pil: Image.Image, mask_tensor: torch.Tensor) -> str:
     img_np = np.array(original_pil) 
     mask_np = (mask_tensor.squeeze().cpu().numpy() * 255).astype(np.uint8) 
-    
     if np.sum(mask_np) > 0:
         color_mask = np.zeros_like(img_np)
         color_mask[mask_np > 128] = [0, 255, 0] 
@@ -251,90 +189,17 @@ def create_overlay_image(original_pil: Image.Image, mask_tensor: torch.Tensor) -
         cv2.drawContours(overlay, contours, -1, (255, 0, 0), 2)
     else:
         overlay = img_np
-
     overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
     success, buffer = cv2.imencode(".png", overlay_bgr)
     if not success: return ""
     return f"data:image/png;base64,{base64.b64encode(buffer).decode('utf-8')}"
 
 # ==========================================
-# VALIDACIÓN DE CONTENIDO DE LA IMAGEN
+# PREDICCIÓN CON INCERTIDUMBRE (Solo Tostado)
 # ==========================================
-"""
-Analiza la máscara segmentada para validar que el contenido corresponde
-realmente a granos de café y no a objetos ajenos o ruido visual.
-
-
-Se consideran métricas geométricas como:
-- Número de objetos
-- Proporción de área ocupada
-- Convexidad y relación de aspecto
-"""
-
-def analyze_coffee_content(mask_tensor_cpu):
-
-    mask_np = (mask_tensor_cpu.numpy() * 255).astype(np.uint8)
-    total_area = mask_np.shape[0] * mask_np.shape[1]
-    
-    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return False, "No se detectó ningún objeto", {}
-
-    valid_contours = [c for c in contours if cv2.contourArea(c) > 30]
-    num_objects = len(valid_contours)
-    
-    mask_pixel_count = np.sum(mask_np > 0)
-    mask_ratio = mask_pixel_count / total_area
-
-    metrics = {
-        "num_objects": num_objects,
-        "mask_ratio": mask_ratio
-    }
-
-    
-    if mask_ratio > SINGLE_OBJ_MAX_AREA_RATIO:
-        return False, "Posible fondo o textura (Área excesiva)", metrics
-
-   
-    if num_objects < MIN_OBJECTS_FOR_LOOSE_CHECK:
-        c = max(valid_contours, key=cv2.contourArea)
-        area = cv2.contourArea(c)
-        hull = cv2.convexHull(c)
-        hull_area = cv2.contourArea(hull)
-        if hull_area == 0: return False, "Error geométrico", metrics
-        
-        solidity = float(area) / hull_area
-        x,y,w,h = cv2.boundingRect(c)
-        aspect_ratio = float(w)/h
-        
-        metrics["solidity"] = solidity
-        metrics["aspect_ratio"] = aspect_ratio
-        
-        if solidity < SINGLE_OBJ_MIN_SOLIDITY:
-            return False, f"Objeto único irregular. No parece un grano de café.", metrics
-        
-        if aspect_ratio < SINGLE_OBJ_MIN_AR or aspect_ratio > SINGLE_OBJ_MAX_AR:
-             return False, f"Objeto único deforme", metrics
-    else:
-
-        if mask_ratio < MULTI_OBJ_MIN_AREA_RATIO:
-             return False, "Muy poco contenido detectado", metrics
-
-    return True, "OK", metrics
-
-# ==========================================
-# PREDICCIÓN CON INCERTIDUMBRE
-# ==========================================
-"""
-Realiza inferencia utilizando MC Dropout para estimar la incertidumbre
-asociada a la predicción del modelo de clasificación.
-"""
-
 def predict_with_uncertainty(model, input_tensor, num_samples=10):
-    model.train() # Habilitar Dropout
+    model.train() 
     predictions = []
-    
     with torch.no_grad():
         for _ in range(num_samples):
             logits = model(input_tensor)
@@ -343,7 +208,6 @@ def predict_with_uncertainty(model, input_tensor, num_samples=10):
     
     model.eval()
     predictions = np.vstack(predictions)
-    
     mean_probs = np.mean(predictions, axis=0)
     std_dev = np.std(predictions, axis=0)
     
@@ -354,76 +218,73 @@ def predict_with_uncertainty(model, input_tensor, num_samples=10):
     return best_class_idx, mean_confidence, uncertainty_score
 
 # ==========================================
-# ENDPOINT PRINCIPAL DE PREDICCIÓN
+# ENDPOINT PRINCIPAL
 # ==========================================
-"""
-Endpoint principal de la API.
-
-
-Recibe una imagen, ejecuta la segmentación, valida el contenido,
-clasifica el grado de tostado y retorna el resultado junto con
-métricas y visualización de la segmentación.
-"""
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_roast(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        image_pil = Image.open(io.BytesIO(contents)).convert('RGB')
-        image_pil = image_pil.resize(IMG_SIZE, Image.Resampling.BILINEAR)
-        
-        input_raw = process_pil_to_tensor(image_pil)
+    # ------------------------------------------------------------------
+        # RAMA A: PREPARACIÓN PARA FILTRO BINARIO (224x224)
+        # ------------------------------------------------------------------
+        # Redimensionamos específicamente para ConvNeXt
+        pil_binary = original_pil.resize(IMG_SIZE_BINARY, Image.Resampling.BILINEAR)
+        input_binary = process_pil_to_tensor(pil_binary)
+        input_binary_norm = normalize(input_binary)
 
-        # A. Segmentación
-        app.state.unet.eval()
+        # ------------------------------------------------------------------
+        # RAMA B: PREPARACIÓN PARA TOSTADO (128x128)
+        # ------------------------------------------------------------------
+        # Redimensionamos para UNet y RoastCNN
+        pil_roast = original_pil.resize(IMG_SIZE, Image.Resampling.BILINEAR)
+        input_roast = process_pil_to_tensor(pil_roast)
+        input_roast_norm = normalize(input_roast)
+
+       # ------------------------------------------------------------------
+        # FASE 1: FILTRO BINARIO (Usando entrada 224)
+        # ------------------------------------------------------------------
         with torch.no_grad():
-            unet_input = normalize(input_raw)
-            mask_logits = app.state.unet(unet_input)
-            mask = (torch.sigmoid(mask_logits) > 0.5).float()
+            binary_logit = app.state.binary_cnn(input_binary_norm)
+            coffee_prob = torch.sigmoid(binary_logit).item()
             
-        overlay_b64 = create_overlay_image(image_pil, mask)
+        if coffee_prob < 0.5:
+            dummy_overlay = create_overlay_image(pil_roast, torch.zeros((1, 1, 128, 128)))
+            
+            logger.info(f"Rechazo Binario: Probabilidad {coffee_prob:.2f}")
+            
+            user_msg = "No se logró identificar granos de café en la imagen. Por favor, asegúrate de que los granos estén centrados y bien iluminados."
+            if coffee_prob > 0.2:
+                user_msg = "Parece café, pero la imagen no es clara. Intenta acercar la cámara y enfocar mejor los granos."
 
-        # B. Análisis Inteligente de Contenido
-        is_valid_content, reason, metrics = analyze_coffee_content(mask.squeeze().cpu())
-        
-        if not is_valid_content:
-            logger.info(f"Rechazo de contenido: {reason} | Métricas: {metrics}")
             return PredictionResponse(
                 clase_predicha="No Coffee",
-                confianza=0.0,
-                segmentacion_base64=overlay_b64,
-                mensaje_error=reason,
-                metricas_validacion=metrics
+                confianza=1.0 - coffee_prob,
+                segmentacion_base64=dummy_overlay,
+                mensaje_error=user_msg,
+                metricas_validacion={"binary_score": coffee_prob}
             )
-        
-        segmented_raw = input_raw * mask
+
+        # ------------------------------------------------------------------
+        # FASE 2: SEGMENTACIÓN (Usando entrada 128)
+        # ------------------------------------------------------------------
+        app.state.unet.eval()
+        with torch.no_grad():
+            mask_logits = app.state.unet(input_roast_norm)
+            mask = (torch.sigmoid(mask_logits) > 0.5).float()
+            
+        overlay_b64 = create_overlay_image(pil_roast, mask)
+
+        # ------------------------------------------------------------------
+        # FASE 3: CLASIFICACIÓN DE TOSTADO (Usando entrada 128)
+        # ------------------------------------------------------------------
+        segmented_raw = input_roast * mask  
         cnn_input = normalize(segmented_raw)
         
         pred_idx, confidence, uncertainty = predict_with_uncertainty(
-            app.state.cnn, cnn_input, num_samples=MC_DROPOUT_ITERATIONS
+            app.state.roast_cnn, cnn_input, num_samples=15
         )
         
-        metrics["uncertainty"] = float(uncertainty)
-
-        if uncertainty > MAX_STD_DEV:
-             logger.info(f"Rechazo por Incertidumbre: {uncertainty:.3f}")
-             return PredictionResponse(
-                clase_predicha="Unknown",
-                confianza=float(confidence),
-                segmentacion_base64=overlay_b64,
-                mensaje_error="Objeto ambiguo (Alta incertidumbre del modelo)",
-                metricas_validacion=metrics
-            )
-
-        if confidence < CONF_THRESHOLD:
-             return PredictionResponse(
-                clase_predicha="Unknown",
-                confianza=float(confidence),
-                segmentacion_base64=overlay_b64,
-                mensaje_error=f"Confianza insuficiente ({confidence:.1%})",
-                metricas_validacion=metrics
-            )
-
         class_name = CLASS_NAMES.get(pred_idx, "Error")
         
         return PredictionResponse(
@@ -431,19 +292,13 @@ async def predict_roast(file: UploadFile = File(...)):
             confianza=float(confidence),
             segmentacion_base64=overlay_b64,
             mensaje_error="",
-            metricas_validacion=metrics
+            metricas_validacion={"uncertainty": float(uncertainty), "coffee_prob": coffee_prob}
         )
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error crítico: {e}")
         return JSONResponse(status_code=500, content={"message": str(e)})
 
-# ==========================================
-# ENDPOINT DE ESTADO
-# ==========================================
-"""
-Endpoint básico de verificación de estado de la API.
-"""
 @app.get("/")
 def root():
     return {"status": "online"}
